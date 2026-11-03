@@ -14,7 +14,7 @@ Type=notify
 NotifyAccess=main
 User=garden
 WorkingDirectory=/home/garden/wateringSystem
-ExecStart=/usr/bin/python3 -u /home/garden/wateringSystem/autoWatering.py
+ExecStart=/home/garden/wateringSystem/venv/bin/python -u /home/garden/wateringSystem/autoWatering.py
 # Restart after a crash, and kill and restart it if the main loop stops checking in for 2 minutes
 Restart=always
 RestartSec=10

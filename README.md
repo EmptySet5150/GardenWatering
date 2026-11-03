@@ -7,12 +7,20 @@ with it
 
 ## Setup on the Raspberry Pi
 
-Works on a Pi 4 or older. `RPi.GPIO` and `pigpio` do not support the Pi 5.
+Works on a Pi 4 or older with Python 3. `RPi.GPIO` and `pigpio` do not support the Pi 5.
+
+Put the code in `/home/garden/wateringSystem`, then from that folder:
 
 ```
-sudo apt install pigpio python3-pip
-pip3 install -r requirements.txt
+sudo apt update
+sudo apt install pigpio python3-pigpio python3-rpi.gpio python3-venv
+python3 -m venv --system-site-packages venv
+venv/bin/pip install -r requirements.txt
 ```
+
+Raspberry Pi OS Bookworm and newer block `pip install` outside a virtual environment, so the
+packages go in `venv`. `--system-site-packages` lets it use the `pigpio` and `RPi.GPIO` installed by
+apt, so pip only adds `peewee` and `RPLCD`.
 
 Settings (days between waterings, pump run time, low water wait, watering hour) are in `config.ini`.
 
