@@ -2,7 +2,8 @@
 Runs autoWatering.py on a PC with pretend hardware so you can try it without a Raspberry Pi.
 
 The real autoWatering.py runs unchanged. This file swaps in fake versions of RPi.GPIO, pigpio,
-DHT22 and RPLCD, and a simulated clock you can speed up. Each time the program starts it uses a
+DHT22, RPLCD and smbus2 (for the ADS1115 and moisture sensor), pretend soil that dries out and
+soaks up water, and a simulated clock you can speed up. Each time the program starts it uses a
 fresh copy of the project's config.ini, and it keeps its own gardenDB.db in the sim_data folder so
 the real database is never touched.
 
@@ -10,6 +11,7 @@ Run it with:  python simulator.py   (needs peewee:  pip install peewee)
 """
 
 import builtins
+import configparser
 import os
 import queue
 import shutil
@@ -26,7 +28,11 @@ SIM_DIR = os.path.join(HERE, 'sim_data')
 SCRIPT = os.path.join(HERE, 'autoWatering.py')
 
 # Pin numbers from autoWatering.py (BOARD numbering)
-RAIN_PIN, WATER_PIN, VALVE_PIN, PUMP_PIN = 40, 16, 22, 32
+WATER_PIN, VALVE_PIN, PUMP_PIN = 16, 22, 32
+
+# How fast the pretend soil changes: watering adds this many percent per minute, and it dries
+# out by a few percent per hour, faster when it's hot
+WET_PER_MINUTE = 3.0
 
 
 class SimClock:
@@ -58,8 +64,13 @@ class Hardware:
 
     def __init__(self):
         self.pins = {VALVE_PIN: 1, PUMP_PIN: 1}  # relays are active low, 1 = off
-        self.rain_wet = False
         self.tank_low = False
+        self.moisture = 45.0  # percent
+        self.soil_auto = True  # soil dries out and soaks up water by itself
+        self.soil_time = None  # simulated time the soil was last updated
+        self.sensor_unplugged = False
+        self.dry_reading = 20000  # calibration, read from config.ini when the program starts
+        self.wet_reading = 8800
         self.temp_f = 72.0
         self.humidity = 55.0
         self.lcd = [[' '] * 20 for _ in range(4)]
@@ -78,6 +89,21 @@ class StopProgram:
     handler = None
 
 
+def update_soil():
+    """Moves the pretend soil moisture on by however much simulated time has passed."""
+    now = clock.now()
+    elapsed = 0 if hw.soil_time is None else now - hw.soil_time
+    hw.soil_time = now
+    if not hw.soil_auto or elapsed <= 0:
+        return
+    if hw.pins.get(PUMP_PIN) == 0:
+        hw.moisture += elapsed / 60 * WET_PER_MINUTE
+    else:
+        dry_per_hour = 0.6 + max(0.0, hw.temp_f - 50) * 0.04
+        hw.moisture -= elapsed / 3600 * dry_per_hour
+    hw.moisture = max(0.0, min(100.0, hw.moisture))
+
+
 # ---------- Fake hardware modules ----------
 def make_fake_modules():
     gpio = types.ModuleType('RPi.GPIO')
@@ -94,8 +120,6 @@ def make_fake_modules():
         hw.pins[pin] = 1 if value else 0
 
     def gpio_input(pin):
-        if pin == RAIN_PIN:
-            return 0 if hw.rain_wet else 1  # LOW = wet
         if pin == WATER_PIN:
             return 0 if hw.tank_low else 1  # switch closed (LOW) = tank low
         return hw.pins.get(pin, 1)
@@ -159,7 +183,40 @@ def make_fake_modules():
             hw.cursor = (row, col)
 
     rplcd.CharLCD = CharLCD
-    return {'RPi': rpi, 'RPi.GPIO': gpio, 'pigpio': pigpio, 'DHT22': dht, 'RPLCD': rplcd}
+
+    smbus2 = types.ModuleType('smbus2')
+
+    class SMBus:
+        """The ADS1115 on the I2C bus, reading the pretend moisture sensor on A0."""
+
+        def __init__(self, bus=None):
+            pass
+
+        def _check(self):
+            if hw.sensor_unplugged:
+                raise OSError(121, 'Remote I/O error')
+
+        def write_i2c_block_data(self, address, register, data):
+            self._check()
+
+        def read_i2c_block_data(self, address, register, length):
+            self._check()
+            update_soil()
+            # The sensor's voltage drops as the soil gets wetter
+            raw = int(hw.dry_reading - hw.moisture / 100 * (hw.dry_reading - hw.wet_reading))
+            return [(raw >> 8) & 0xFF, raw & 0xFF]
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    smbus2.SMBus = SMBus
+    return {'RPi': rpi, 'RPi.GPIO': gpio, 'pigpio': pigpio, 'DHT22': dht, 'RPLCD': rplcd, 'smbus2': smbus2}
 
 
 # ---------- Fake time, datetime and signal, seen only by autoWatering.py ----------
@@ -245,6 +302,10 @@ class Program:
             return
         os.makedirs(SIM_DIR, exist_ok=True)
         shutil.copy(os.path.join(HERE, 'config.ini'), SIM_DIR)  # always use the current settings
+        config = configparser.ConfigParser()
+        config.read(os.path.join(SIM_DIR, 'config.ini'))
+        hw.dry_reading = config.getint('moisture_sensor', 'dry_reading', fallback=20000)
+        hw.wet_reading = config.getint('moisture_sensor', 'wet_reading', fallback=8800)
         StopProgram.requested = False
         self.globals = {'__name__': '__main__', '__file__': os.path.join(SIM_DIR, 'autoWatering.py'),
                         '__builtins__': make_builtins()}
@@ -316,7 +377,7 @@ def run_window():
     clock_lbl = ttk.Label(sched, style='Clock.TLabel')
     clock_lbl.grid(row=0, column=0, columnspan=2, sticky='w')
     rows = {}
-    for i, key in enumerate(('Running', 'Last watered', 'Next watering', 'Pump stops at', 'Settings')):
+    for i, key in enumerate(('Running', 'Last watered', 'Soaking until', 'Pump stops at', 'Settings')):
         ttk.Label(sched, text=key + ':', style='Big.TLabel').grid(row=i + 1, column=0, sticky='w', padx=(0, 10))
         rows[key] = ttk.Label(sched, style='Big.TLabel')
         rows[key].grid(row=i + 1, column=1, sticky='w')
@@ -331,28 +392,38 @@ def run_window():
     valve_light = lights.create_oval(170, 10, 210, 50, outline='#333', width=2)
     lights.create_text(220, 30, anchor='w', text='Valve', font=('Segoe UI', 12, 'bold'))
 
-    rain_var = tk.BooleanVar(value=False)
+    # Soil moisture
+    moist_lbl = ttk.Label(hwf, style='Big.TLabel')
+    moist_lbl.grid(row=1, column=0, columnspan=2, sticky='w')
+    moist = ttk.Scale(hwf, from_=0, to=100, length=260, command=lambda v: setattr(hw, 'moisture', float(v)))
+    moist.set(hw.moisture)
+    moist.grid(row=2, column=0, columnspan=2, sticky='w')
+    auto_var = tk.BooleanVar(value=True)
+    unplug_var = tk.BooleanVar(value=False)
     tank_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(hwf, text='Raining (rain sensor wet)', variable=rain_var,
-                    command=lambda: setattr(hw, 'rain_wet', rain_var.get())).grid(row=1, column=0, columnspan=2,
-                                                                                 sticky='w', pady=4)
+    ttk.Checkbutton(hwf, text='Soil dries out and soaks up water by itself', variable=auto_var,
+                    command=lambda: setattr(hw, 'soil_auto', auto_var.get())).grid(row=3, column=0, columnspan=2,
+                                                                                  sticky='w', pady=(4, 0))
+    ttk.Checkbutton(hwf, text='Moisture sensor unplugged', variable=unplug_var,
+                    command=lambda: setattr(hw, 'sensor_unplugged', unplug_var.get())).grid(row=4, column=0,
+                                                                                           columnspan=2, sticky='w')
     ttk.Checkbutton(hwf, text='Water tank low (float switch closed)', variable=tank_var,
-                    command=lambda: setattr(hw, 'tank_low', tank_var.get())).grid(row=2, column=0, columnspan=2,
-                                                                                 sticky='w', pady=4)
+                    command=lambda: setattr(hw, 'tank_low', tank_var.get())).grid(row=5, column=0, columnspan=2,
+                                                                                 sticky='w')
     temp_lbl = ttk.Label(hwf, style='Big.TLabel')
-    temp_lbl.grid(row=3, column=0, sticky='w', pady=(10, 0))
+    temp_lbl.grid(row=6, column=0, sticky='w', pady=(8, 0))
     temp = ttk.Scale(hwf, from_=20, to=110, length=260, command=lambda v: setattr(hw, 'temp_f', float(v)))
     temp.set(hw.temp_f)
-    temp.grid(row=4, column=0, columnspan=2, sticky='w')
+    temp.grid(row=7, column=0, columnspan=2, sticky='w')
     hum_lbl = ttk.Label(hwf, style='Big.TLabel')
-    hum_lbl.grid(row=5, column=0, sticky='w', pady=(10, 0))
+    hum_lbl.grid(row=8, column=0, sticky='w', pady=(8, 0))
     hum = ttk.Scale(hwf, from_=0, to=100, length=260, command=lambda v: setattr(hw, 'humidity', float(v)))
     hum.set(hw.humidity)
-    hum.grid(row=6, column=0, columnspan=2, sticky='w')
+    hum.grid(row=9, column=0, columnspan=2, sticky='w')
 
     # Time and program controls
     ctl = ttk.LabelFrame(hwf, text='Time', padding=8)
-    ctl.grid(row=7, column=0, columnspan=2, sticky='ew', pady=(14, 0))
+    ctl.grid(row=10, column=0, columnspan=2, sticky='ew', pady=(10, 0))
     speed_var = tk.StringVar(value='1')
     for i, (label, value) in enumerate((('1x', '1'), ('60x (1 min/s)', '60'), ('600x', '600'),
                                         ('3600x (1 hr/s)', '3600'))):
@@ -360,22 +431,22 @@ def run_window():
                         command=lambda: clock.set_speed(float(speed_var.get()))).grid(row=i // 2, column=i % 2,
                                                                                      sticky='w', padx=(0, 12))
 
-    def jump_to_next():
-        nxt = program.value('nextWatering')
-        if nxt is None:
+    def skip_soak():
+        soak = program.value('soakUntil')
+        if soak is None:
             return
-        gap = nxt.timestamp() - clock.now() - 3
+        gap = soak.timestamp() - clock.now() + 1
         if gap > 0:
             clock.jump(gap)
-            log_queue.put(f'--- Jumped ahead {timedelta(seconds=int(gap))} ---')
+            log_queue.put(f'--- Skipped the soak wait ({timedelta(seconds=int(gap))}) ---')
 
     btns = ttk.Frame(ctl)
     btns.grid(row=2, column=0, columnspan=2, sticky='w', pady=(8, 0))
-    ttk.Button(btns, text='Jump to next watering', command=jump_to_next).pack(side='left')
+    ttk.Button(btns, text='Skip soak wait', command=skip_soak).pack(side='left')
     ttk.Button(btns, text='+1 hour', command=lambda: clock.jump(3600)).pack(side='left', padx=6)
 
     prog = ttk.Frame(hwf)
-    prog.grid(row=8, column=0, columnspan=2, sticky='w', pady=(12, 0))
+    prog.grid(row=11, column=0, columnspan=2, sticky='w', pady=(10, 0))
     start_btn = ttk.Button(prog, text='Start program', command=program.start)
     start_btn.pack(side='left')
     stop_btn = ttk.Button(prog, text='Stop (like systemd)', command=program.stop)
@@ -404,7 +475,7 @@ def run_window():
     log.pack(fill='both', expand=True)
     dbf = ttk.LabelFrame(bottom, text='Database (newest rows)', padding=4)
     dbf.grid(row=0, column=1, sticky='nsew')
-    cols = ('Time', 'Pump', 'Valve', 'Rain', 'Tank', 'Temp', 'Next watering')
+    cols = ('Time', 'Pump', 'Valve', 'Soil', 'Tank', 'Temp', 'Soak until')
     table = ttk.Treeview(dbf, columns=cols, show='headings', height=12)
     for c, w in zip(cols, (120, 45, 50, 45, 40, 50, 120)):
         table.heading(c, text=c)
@@ -427,20 +498,24 @@ def run_window():
         last_db['mtime'] = mtime
         try:
             con = sqlite3.connect(path)
-            data = con.execute('select TimeNow, PumpStatus, ValveStatus, Rain, WaterLevel, Temperature, NextWatering '
-                               'from sensor order by id desc limit 40').fetchall()
+            data = con.execute('select TimeNow, PumpStatus, ValveStatus, Moisture, WaterLevel, Temperature, SoakUntil '
+                               'from readings order by id desc limit 40').fetchall()
             con.close()
         except sqlite3.Error:
             return
         table.delete(*table.get_children())
         for r in data:
-            table.insert('', 'end', values=(short(r[0]), r[1], r[2], r[3], 'LOW' if r[4] < 10 else 'OK',
-                                            r[5], short(r[6])))
+            table.insert('', 'end', values=(short(r[0]), r[1], r[2], 'ERR' if r[3] is None else f'{r[3]}%',
+                                            'LOW' if r[4] < 10 else 'OK', r[5], short(r[6])))
 
     def fmt(v):
         return v.strftime('%a %d %b %H:%M') if isinstance(v, real_datetime) else '-'
 
     def tick():
+        update_soil()
+        if hw.soil_auto:
+            moist.set(hw.moisture)
+        moist_lbl.configure(text=f'Soil moisture: {hw.moisture:.0f} %')
         for r in range(4):
             lcd.itemconfigure(lcd_lines[r], text=''.join(hw.lcd[r]))
         pump_on = hw.pins.get(PUMP_PIN) == 0
@@ -451,13 +526,15 @@ def run_window():
             '%a %d %b %Y  %H:%M:%S'))
         rows['Running'].configure(text='yes' if program.running else 'no')
         rows['Last watered'].configure(text=fmt(program.value('lastWatered')))
-        rows['Next watering'].configure(text=fmt(program.value('nextWatering')))
+        soak = program.value('soakUntil')
+        soaking = isinstance(soak, real_datetime) and soak.timestamp() > clock.now()
+        rows['Soaking until'].configure(text=fmt(soak) if soaking else '-')
         pump_stop = program.value('pumpStopTime') if pump_on else None
         rows['Pump stops at'].configure(text=fmt(pump_stop))
-        if program.value('waitDays') is not None:
-            rows['Settings'].configure(text=f"every {program.value('waitDays')} days at "
-                                            f"{program.value('wateringHour')}:00, pump "
-                                            f"{program.value('pumpRunTime')} min")
+        if program.value('dryLevel') is not None:
+            rows['Settings'].configure(text=f"water below {program.value('dryLevel')}%, pump "
+                                            f"{program.value('pumpRunTime')} min, soak "
+                                            f"{program.value('soakTime')} min")
         temp_lbl.configure(text=f'Temperature: {hw.temp_f:.0f} F')
         hum_lbl.configure(text=f'Humidity: {hw.humidity:.0f} %')
         start_btn.state(['disabled'] if program.running else ['!disabled'])

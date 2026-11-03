@@ -1,13 +1,13 @@
 """
-This program  gets data from several sensors
-to  determine  when the  garden needs  to be 
-watered. When it needs watering it will turn
-on a pump and  open a valve for a set amount
-of time to water the garden. If it starts to
-rain the pump will  shut off  and rest to the
-next watering date.  If the water level  gets
-low the pump shuts off and waits for the tank
-to be filled, then waters if it is time to.
+This program  reads a soil  moisture sensor
+to  determine  when the  garden needs  to be
+watered. When the soil is drier than the set
+level it opens a valve and runs a pump for a
+set amount of time, then waits for the water
+to soak  in before it checks the soil again.
+If the water level gets low the pump shuts off
+and waits for the tank to be filled, then
+waters if the soil is still dry.
 
 Settings are read from config.ini next to this file.
 It is meant to run as a systemd service (see garden-watering.service).
@@ -22,6 +22,7 @@ import os
 import signal
 import socket
 import sys
+from smbus2 import SMBus  # Used to talk to the ADS1115 that reads the moisture sensor
 from model import SensorData  # Using peewee to interface with a SQLite database
 import RPi.GPIO as GPIO
 import DHT22  # Used for Temperature and Humidity sensor
@@ -33,40 +34,42 @@ pi = pigpio.pi()  # Only used for DHT22 sensor - Looking into another library
 GPIO.setmode(GPIO.BOARD)  # Setting the pin number
 lcd = CharLCD(cols=20, rows=4, pin_rs=11, pin_e=12, pins_data=[31, 33, 35, 37])
 dht22 = DHT22.sensor(pi, 22)  # This library is setup for GPIO numbering
-rainSensor = 40
 waterValveControl = 22
 pumpControl = 32
 waterLevel = 16
+i2c = SMBus(1)  # I2C bus on pins 3 (SDA) and 5 (SCL)
+ADS1115_ADDRESS = 0x48  # The ADS1115's ADDR pin is wired to GND
 sensorDatabase = SensorData()
 
 # Setup GPIO pin modes
 GPIO.setup(waterValveControl, GPIO.OUT, initial=GPIO.HIGH)  # Set pin as output - relays are active low so start HIGH (off)
 GPIO.setup(pumpControl, GPIO.OUT, initial=GPIO.HIGH)  # Set pin as output - relays are active low so start HIGH (off)
-GPIO.setup(rainSensor, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Set pin as input and use internal pull up resistor
 GPIO.setup(waterLevel, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Set pin as imput and use internal pull up resistor
 
 # Read the settings from config.ini
 config = configparser.ConfigParser()
 if not config.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')):
     sys.exit("config.ini is missing")
-waitDays = config.getint('watering', 'wait_days')
+dryLevel = config.getint('watering', 'dry_level')
 pumpRunTime = config.getint('watering', 'pump_run_minutes')
-wateringHour = config.getint('watering', 'watering_hour')
+soakTime = config.getint('watering', 'soak_minutes')
+dryReading = config.getint('moisture_sensor', 'dry_reading')
+wetReading = config.getint('moisture_sensor', 'wet_reading')
 
 # Setup some global variables
-firstRain = 1  # Setting this so we only get one reading while its raining
 firstLowWater = 1  # Setting this so we only get one reading while water level is low
+firstSensorError = 1  # Setting this so we only get one message while the moisture sensor can't be read
 lastDhtRead = 0  # Time of the last DHT22 reading
 nextLogTime = datetime.now()  # Sensor readings are saved to the database every ten minutes
 
-# Get the watering schedule from the last database row so a restart doesn't water right away
-lastWatered = datetime.now()
-nextWatering = datetime.now()
+# Get the last watering and soak times from the database so a restart doesn't water during a soak
+lastWatered = None
+soakUntil = datetime.now()
 pumpStopTime = datetime.now()
 lastRow = sensorDatabase.getLast()
-if lastRow is not None and isinstance(lastRow.LastWatering, datetime) and isinstance(lastRow.NextWatering, datetime):
+if lastRow is not None and isinstance(lastRow.SoakUntil, datetime):
     lastWatered = lastRow.LastWatering
-    nextWatering = lastRow.NextWatering
+    soakUntil = lastRow.SoakUntil
 
 
 # Tells systemd we are ready or still alive - does nothing when not running as a service
@@ -79,11 +82,6 @@ def sd_notify(state):
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
         sock.connect(address)
         sock.sendall(state.encode())
-
-
-# Returns the next watering time, some days from now at the watering hour
-def watering_time(days):
-    return (datetime.now() + timedelta(days=days)).replace(hour=wateringHour, minute=0, second=0, microsecond=0)
 
 
 # systemd stops the service with SIGTERM - turn it into a normal exit so the finally block runs
@@ -116,6 +114,30 @@ def humidity_status():
     return humid
 
 
+# Reads the moisture sensor's voltage on the ADS1115's A0 input as a raw number
+def read_moisture_raw():
+    i2c.write_i2c_block_data(ADS1115_ADDRESS, 0x01, [0xC3, 0x83])  # Start one reading of A0, range +-4.096V
+    sleep(.01)  # A reading takes about 8 ms
+    high, low = i2c.read_i2c_block_data(ADS1115_ADDRESS, 0x00, 2)
+    raw = (high << 8) | low
+    return raw - 65536 if raw > 32767 else raw
+
+
+# Returns soil moisture from 0 (dry air) to 100 (in water), or None if the sensor can't be read
+def moisture_status():
+    global firstSensorError
+    try:
+        raw = read_moisture_raw()
+    except OSError:
+        if firstSensorError == 1:
+            firstSensorError = firstSensorError + 1
+            print("Moisture sensor can't be read - check the ADS1115 wiring")
+        return None
+    firstSensorError = 1
+    percent = (dryReading - raw) * 100 / (dryReading - wetReading)  # The sensor's voltage drops as the soil gets wetter
+    return int(round(max(0, min(100, percent))))
+
+
 # Function starts or stops the pump and opens or closes the water valve and returns its status
 def pump_control(cont):
     if cont == 'Start':
@@ -140,13 +162,6 @@ def water_status():
         return 77
 
 
-def rain_status():
-    if GPIO.input(rainSensor) == False:
-        return 'WET'
-    elif GPIO.input(rainSensor) == True:
-        return 'DRY'
-
-
 def pump_status():
     if GPIO.input(pumpControl) == False:
         return 'ON'
@@ -161,30 +176,44 @@ def valve_status():
         return 'SHUT'
 
 
+# Returns one line saying what the system is doing, for the LCD and the terminal
+def watering_state(moisture):
+    if pump_status() == 'ON':
+        return "Watering til " + pumpStopTime.strftime('%H:%M')
+    if water_status() < 10:
+        return "Tank low - no water"
+    if moisture is None:
+        return "Soil sensor ERROR"
+    if datetime.now() < soakUntil:
+        return "Soaking til " + soakUntil.strftime('%H:%M')
+    if moisture < dryLevel:
+        return "Dry - watering now"
+    return "Soil OK"
+
+
 # Function reads the data from all the senors and returns it
 def get_data():
     timenow = (datetime.now().strftime('%d/%m %H:%M'))
     temp = temperature_status()
     humid = humidity_status()
     pump = pump_status()
-    rain = rain_status()
+    moisture = moisture_status()
     waterlevel = water_status()
-    lastwater = lastWatered.strftime('%d/%m %H:%M')
-    nextwater = nextWatering.strftime('%d/%m %H:%M')
+    lastwater = lastWatered.strftime('%d/%m %H:%M') if lastWatered else '--/-- --:--'
     valve = valve_status()
-    pumpstop = pumpStopTime.strftime('%d/%m %H:%M')
-    return timenow, temp, humid, pump, rain, waterlevel, lastwater, nextwater, valve, pumpstop
+    state = watering_state(moisture)
+    return timenow, temp, humid, pump, moisture, waterlevel, lastwater, valve, state
 
 
 # Function reads the sensors and saves them to the database with the times as real datetimes
 def save_database():
-    sensorDatabase.saveData(datetime.now(), lastWatered, nextWatering, pumpStopTime, temperature_status(),
-                            humidity_status(), water_status(), rain_status(), pump_status(), valve_status())
+    sensorDatabase.saveData(datetime.now(), lastWatered, soakUntil, pumpStopTime, temperature_status(),
+                            humidity_status(), moisture_status(), water_status(), pump_status(), valve_status())
 
 
 # Function gets data from get_data and displays it on the LCD screen
 def lcd_display():
-    timenow, temp, humid, pump, rain, waterlevel, lastwater, nextwater, valve, pumpstop = get_data()
+    timenow, temp, humid, pump, moisture, waterlevel, lastwater, valve, state = get_data()
     sleep(5)  # Wait then clear the display
     lcd.clear()
     lcd.cursor_pos = (0, 0)
@@ -200,37 +229,32 @@ def lcd_display():
     lcd.cursor_pos = (3, 0)
     lcd.write_string("LstWater:" + lastwater)
     sleep(5)  # We wait and then clear the screen to display more data
-    waterlevelstr = str(waterlevel)
     lcd.clear()
     lcd.cursor_pos = (0, 0)
     lcd.write_string("Time: " + timenow)
     lcd.cursor_pos = (1, 0)
-    lcd.write_string("Temp " + temp)
-    lcd.cursor_pos = (1, 10)
-    lcd.write_string("Humid " + humid)
+    lcd.write_string("Soil " + ('ERR ' if moisture is None else '%3d%%' % moisture))
+    lcd.cursor_pos = (1, 11)
+    lcd.write_string("Dry<%d%%" % dryLevel)
     lcd.cursor_pos = (2, 0)
-    lcd.write_string("Rain:" + rain)
-    lcd.cursor_pos = (2, 12)
-    lcd.write_string("Tank:" + waterlevelstr)
+    lcd.write_string("Tank:" + ('LOW' if waterlevel < 10 else 'OK'))
     lcd.cursor_pos = (3, 0)
-    lcd.write_string("NxtWater:" + nextwater)
+    lcd.write_string(state)
 
 
 # Function gets data from get_data() and print is to the terminal window
 def print_data():
-    timenow, temp, humid, pump, rain, waterlevel, lastwater, nextwater, valve, pumpstop = get_data()
-    waterlevelstr = str(waterlevel)
+    timenow, temp, humid, pump, moisture, waterlevel, lastwater, valve, state = get_data()
     print("    -----START-----")
     print('Temperature    -- ' + temp + 'F')
     print('Humidity       -- ' + humid + '%')
+    print('Soil Moisture  -- ' + ('ERROR' if moisture is None else str(moisture) + '%'))
     print('Pump Status    -- ' + pump)
     print('Water Valve    -- ' + valve)
-    print('Rain Sensor    -- ' + rain)
-    print('Water Level    -- ' + waterlevelstr)
+    print('Water Level    -- ' + str(waterlevel))
     print('Time Now       -- ' + (datetime.now().strftime('%d/%m/%y %H:%M:%S')))
     print('Last Watered   -- ' + lastwater)
-    print('Pump Stop Time -- ' + pumpstop)
-    print('Next Watering  -- ' + nextwater)
+    print('Status         -- ' + state)
     print("    ------END------")
 
 
@@ -243,43 +267,32 @@ try:
         print_data()
         print("Main loop display")
         print("FirstLowWater " + str(firstLowWater))
-        print("FirstRain " + str(firstRain))
-        # Save the sensor readings every ten minutes (this used to be the gardenDataSave.py cron job)
+        # Save the sensor readings every ten minutes
         if datetime.now() >= nextLogTime:
             nextLogTime = datetime.now() + timedelta(minutes=10)
             save_database()
             print("Saved to database - TEN MINUTE LOG")
-        # If the pump is off we check to see if its time to turn it on - never start it in the rain or with a low tank
-        if pump_status() == 'OFF' and datetime.now() >= nextWatering and rain_status() == 'DRY' and water_status() >= 10:
+        # Start the pump when the soil is dry, unless the last watering is still soaking in or the tank is low
+        moisture = moisture_status()
+        if pump_status() == 'OFF' and moisture is not None and moisture < dryLevel \
+                and datetime.now() >= soakUntil and water_status() >= 10:
             pumpStopTime = datetime.now() + timedelta(minutes=pumpRunTime)
-            print("Time to Start pump")
+            print("Soil is dry (" + str(moisture) + "%) - starting pump")
             pump_control('Start')
             save_database()
             print("Saved to database - PUMP ON")
             # NOTE: valve_status() only reads back the relay pin we just set, so it can't tell
             # if the valve really opened. A valve failure check needs a feedback sensor on the valve.
-        # If the pump is on we check to see if it is time to turn it off and update nextWatering
+        # When the run time is up, stop the pump and give the water time to soak in before checking again
         if pump_status() == 'ON' and datetime.now() >= pumpStopTime:
             lastWatered = datetime.now()
-            nextWatering = watering_time(waitDays)
-            print("Pump was turned off")
+            soakUntil = datetime.now() + timedelta(minutes=soakTime)
+            print("Pump was turned off - soaking until " + soakUntil.strftime('%H:%M'))
             pump_control('Stop')
             save_database()
             print("Saved to database - PUMP STOP TIME")
-        # If the rain sensor is wet we reset the nextWatering and lastWatered time
-        if firstRain == 1 and rain_status() == 'WET':
-            firstRain = firstRain + 1
-            print("Its Raining")
-            pump_control('Stop')
-            lastWatered = datetime.now()
-            nextWatering = watering_time(waitDays)
-            save_database()
-            print("Saved data to database - RAIN SENSOR")
-        if firstRain > 1 and rain_status() == 'DRY':
-            firstRain = 1
-            print("Its Not Raining")
-        # If water level is to low we stop the pump but keep nextWatering, so a watering that is
-        # due starts as soon as the tank is filled again
+        # If water level is to low we stop the pump. When the tank is filled the soil is checked again
+        # and watering starts if it is still dry
         if firstLowWater == 1 and water_status() < 10:
             firstLowWater = firstLowWater + 1
             print("Water Level is LOW")
@@ -298,7 +311,10 @@ finally:
         pump_control('Stop')
     GPIO.output(pumpControl, 1)
     GPIO.output(waterValveControl, 1)
+    lcd.clear()  # So the screen doesn't keep showing the pump as on
+    lcd.write_string("Program stopped")
     sensorDatabase.close()
     print("Closed database")
+    i2c.close()
     GPIO.cleanup()
     print("GPIO pins cleanup")
