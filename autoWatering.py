@@ -17,6 +17,7 @@ It is meant to run as a systemd service (see garden-watering.service).
 from RPLCD import CharLCD  # Libaray for the LCD screen
 from time import sleep, time
 from datetime import datetime, timedelta
+from collections import deque
 import configparser
 import os
 import signal
@@ -61,6 +62,7 @@ wetReading = config.getint('moisture_sensor', 'wet_reading')
 firstLowWater = 1  # Setting this so we only get one reading while water level is low
 firstSensorError = 1  # Setting this so we only get one message while the moisture sensor can't be read
 lastDhtRead = 0  # Time of the last DHT22 reading
+moistureHistory = deque()  # (time, moisture) readings from the last hour, for the soil trend
 nextLogTime = datetime.now()  # Sensor readings are saved to the database every ten minutes
 
 # Get the last watering and soak times from the database so a restart doesn't water during a soak
@@ -192,6 +194,23 @@ def watering_state(moisture):
     return "Soil OK"
 
 
+# Returns how fast the soil moisture is changing, in percent per hour, over the last hour of readings.
+# Returns None until there are at least 10 minutes of readings
+def soil_trend(moisture):
+    now = datetime.now()
+    if moisture is not None and (not moistureHistory or now - moistureHistory[-1][0] >= timedelta(minutes=1)):
+        moistureHistory.append((now, moisture))  # Keep at most one reading a minute
+    while moistureHistory and now - moistureHistory[0][0] > timedelta(hours=1):
+        moistureHistory.popleft()
+    if len(moistureHistory) < 2:
+        return None
+    (firstTime, firstMoisture), (lastTime, lastMoisture) = moistureHistory[0], moistureHistory[-1]
+    hours = (lastTime - firstTime).total_seconds() / 3600
+    if hours < 10 / 60:
+        return None
+    return int(round(max(-999, min(999, (lastMoisture - firstMoisture) / hours))))
+
+
 # Function reads the data from all the senors and returns it
 def get_data():
     timenow = (datetime.now().strftime('%d/%m %H:%M'))
@@ -203,7 +222,8 @@ def get_data():
     lastwater = lastWatered.strftime('%d/%m %H:%M') if lastWatered else '--/-- --:--'
     valve = valve_status()
     state = watering_state(moisture)
-    return timenow, temp, humid, pump, moisture, waterlevel, lastwater, valve, state
+    trend = soil_trend(moisture)
+    return timenow, temp, humid, pump, moisture, trend, waterlevel, lastwater, valve, state
 
 
 # Function reads the sensors and saves them to the database with the times as real datetimes
@@ -214,7 +234,7 @@ def save_database():
 
 # Function gets data from get_data and displays it on the LCD screen
 def lcd_display():
-    timenow, temp, humid, pump, moisture, waterlevel, lastwater, valve, state = get_data()
+    timenow, temp, humid, pump, moisture, trend, waterlevel, lastwater, valve, state = get_data()
     sleep(5)  # Wait then clear the display
     lcd.clear()
     lcd.cursor_pos = (0, 0)
@@ -234,24 +254,23 @@ def lcd_display():
     lcd.cursor_pos = (0, 0)
     lcd.write_string("Time: " + timenow)
     lcd.cursor_pos = (1, 0)
-    lcd.write_string("Soil " + ('ERR ' if moisture is None else '%3d%%' % moisture))
+    lcd.write_string("Soil:" + ('ERR' if moisture is None else '%3d%%' % moisture))
     lcd.cursor_pos = (1, 11)
-    lcd.write_string("Dry<%d%%" % dryLevel)
-    lcd.cursor_pos = (2, 0)
     lcd.write_string("Tank:" + ('LOW' if waterlevel < 10 else 'OK'))
-    lcd.cursor_pos = (2, 11)
-    lcd.write_string("Wet>%d%%" % wetLevel)
+    lcd.cursor_pos = (2, 0)
+    lcd.write_string("Soil Trend: " + ('--' if trend is None else '%+d%%/hr' % trend))
     lcd.cursor_pos = (3, 0)
     lcd.write_string(state)
 
 
 # Function gets data from get_data() and print is to the terminal window
 def print_data():
-    timenow, temp, humid, pump, moisture, waterlevel, lastwater, valve, state = get_data()
+    timenow, temp, humid, pump, moisture, trend, waterlevel, lastwater, valve, state = get_data()
     print("    -----START-----")
     print('Temperature    -- ' + temp + 'F')
     print('Humidity       -- ' + humid + '%')
     print('Soil Moisture  -- ' + ('ERROR' if moisture is None else str(moisture) + '%'))
+    print('Soil Trend     -- ' + ('not enough readings yet' if trend is None else '%+d%% per hour' % trend))
     print('Pump Status    -- ' + pump)
     print('Water Valve    -- ' + valve)
     print('Water Level    -- ' + str(waterlevel))
