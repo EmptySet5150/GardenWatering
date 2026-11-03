@@ -50,3 +50,18 @@ The program turns the pump and valve off when it stops. These keep them off if t
    ```
 3. **Optional: a timer relay on the pump power.** A hardware off-delay timer relay set a little longer
    than the pump run time cuts the pump even if everything else fails.
+
+## Try it without a Raspberry Pi
+
+`simulator.py` runs the real `autoWatering.py` on a PC with pretend hardware, in a small window:
+
+```
+pip install peewee
+python simulator.py
+```
+
+The window shows the LCD and the pump and valve, and lets you make it rain, empty the tank, change the
+temperature and humidity, speed up time (up to an hour per second) or jump to the next watering. The
+Stop button stops the program the same way systemd does, so you can watch it turn the pump off.
+
+The simulator keeps its own `config.ini` and database in `sim_data/`, so it never touches the real ones.
