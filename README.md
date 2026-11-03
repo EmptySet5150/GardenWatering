@@ -13,19 +13,43 @@ Put the code in `/home/garden/wateringSystem`, then from that folder:
 
 ```
 sudo apt update
-sudo apt install pigpio python3-pigpio python3-rpi.gpio python3-venv
+sudo apt install pigpio python3-pigpio python3-rpi.gpio python3-venv i2c-tools
+sudo raspi-config nonint do_i2c 0
+sudo usermod -aG gpio,i2c garden
 python3 -m venv --system-site-packages venv
 venv/bin/pip install -r requirements.txt
 ```
 
+Reboot after that. `raspi-config` turns on I2C, which the moisture sensor's ADS1115 board uses, and
+`usermod` lets the `garden` user reach the GPIO pins and I2C. `i2cdetect -y 1` should show the
+ADS1115 as `48`.
+
 Raspberry Pi OS Bookworm and newer block `pip install` outside a virtual environment, so the
 packages go in `venv`. `--system-site-packages` lets it use the `pigpio` and `RPi.GPIO` installed by
-apt, so pip only adds `peewee` and `RPLCD`.
+apt, so pip only adds `peewee`, `RPLCD` and `smbus2`.
 
-Settings (days between waterings, pump run time, watering hour) are in `config.ini`.
+## How it decides when to water
 
-When the water tank is low the pump stops and nothing is watered. As soon as the tank is filled
-again, it waters if a watering is due.
+A capacitive soil moisture sensor, read through an ADS1115, gives the soil moisture from 0% (dry air)
+to 100% (in water). When it drops below `dry_level`, the pump runs for `pump_run_minutes`. Then it
+waits `soak_minutes` for the water to soak in before checking the soil again, and waters again if the
+soil is still dry. These settings are in `config.ini`.
+
+It never waters while the water tank is low. As soon as the tank is filled again, it waters if the soil
+is still dry. If the moisture sensor can't be read, it doesn't water and the LCD shows
+`Soil sensor ERROR`.
+
+## Calibrate the moisture sensor
+
+Every sensor reads a little differently, so set its dry and wet readings once. Stop the service, then:
+
+```
+venv/bin/python calibrate_moisture.py
+```
+
+Write down the reading with the sensor held in dry air, then with it in a glass of water up to the line
+on the sensor. Put the two numbers in the `[moisture_sensor]` section of `config.ini` as `dry_reading`
+and `wet_reading`.
 
 ## Run it as a service
 
@@ -36,8 +60,8 @@ sudo systemctl enable --now pigpiod garden-watering
 ```
 
 The service starts at boot and restarts the program if it crashes or the main loop stops responding
-for 2 minutes. The last and next watering times are saved in the database, so a restart picks up the
-schedule where it left off. Watch the output with `journalctl -u garden-watering -f`.
+for 2 minutes. The last watering and soak times are saved in the database, so a restart doesn't water
+again while the last watering is still soaking in. Watch the output with `journalctl -u garden-watering -f`.
 
 ## Pump failsafe
 
@@ -63,9 +87,11 @@ pip install peewee
 python simulator.py
 ```
 
-The window shows the LCD and the pump and valve, and lets you make it rain, empty the tank, change the
-temperature and humidity, speed up time (up to an hour per second) or jump to the next watering. The
-Stop button stops the program the same way systemd does, so you can watch it turn the pump off.
+The window shows the LCD and the pump and valve. The pretend soil dries out over time (faster when it's
+hot) and gets wetter while the pump runs, or you can set the moisture yourself with the slider. You can
+also unplug the moisture sensor, empty the tank, change the temperature and humidity, speed up time (up
+to an hour per second) or skip the soak wait. The Stop button stops the program the same way systemd
+does, so you can watch it turn the pump off.
 
 The simulator uses the settings in `config.ini`. After changing them, press Stop and then Start
 program in the window. It keeps its own database in `sim_data/`, so it never touches the real one.

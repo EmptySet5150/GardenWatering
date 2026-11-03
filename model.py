@@ -8,20 +8,23 @@ from peewee import *
 db = SqliteDatabase('gardenDB.db')
 
 
+# Readings are kept in the "readings" table. Older versions of the program used a "sensor" table
+# with different columns, which is left as it is.
 class Sensor(Model):
     TimeNow = DateTimeField()
-    LastWatering = DateTimeField()
-    NextWatering = DateTimeField()
-    PumpStop = DateTimeField()
+    LastWatering = DateTimeField(null=True)
+    SoakUntil = DateTimeField(null=True)
+    PumpStop = DateTimeField(null=True)
     Temperature = CharField()
     Humidity = CharField()
+    Moisture = IntegerField(null=True)
     WaterLevel = IntegerField()
-    Rain = CharField()
     PumpStatus = CharField()
     ValveStatus = CharField()
 
     class Meta:
         database = db
+        table_name = 'readings'
 
 
 class SensorData(object):
@@ -30,9 +33,9 @@ class SensorData(object):
         db.create_tables([Sensor], safe=True)
 
     # Save one row of sensor readings to the database
-    def saveData(self, timenow, lastwater, nextwater, pumpstop, temp, humid, waterlevel, rain, pump, valve):
-        Sensor.create(TimeNow=timenow, LastWatering=lastwater, NextWatering=nextwater, PumpStop=pumpstop,
-                      Temperature=temp, Humidity=humid, WaterLevel=waterlevel, Rain=rain,
+    def saveData(self, timenow, lastwater, soakuntil, pumpstop, temp, humid, moisture, waterlevel, pump, valve):
+        Sensor.create(TimeNow=timenow, LastWatering=lastwater, SoakUntil=soakuntil, PumpStop=pumpstop,
+                      Temperature=temp, Humidity=humid, Moisture=moisture, WaterLevel=waterlevel,
                       PumpStatus=pump, ValveStatus=valve)
 
     # Returns the newest row, or None if the database is empty

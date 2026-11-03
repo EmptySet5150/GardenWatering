@@ -2,3 +2,4 @@ peewee
 RPi.GPIO
 pigpio
 RPLCD
+smbus2
