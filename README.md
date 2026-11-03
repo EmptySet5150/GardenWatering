@@ -67,4 +67,5 @@ The window shows the LCD and the pump and valve, and lets you make it rain, empt
 temperature and humidity, speed up time (up to an hour per second) or jump to the next watering. The
 Stop button stops the program the same way systemd does, so you can watch it turn the pump off.
 
-The simulator keeps its own `config.ini` and database in `sim_data/`, so it never touches the real ones.
+The simulator uses the settings in `config.ini`. After changing them, press Stop and then Start
+program in the window. It keeps its own database in `sim_data/`, so it never touches the real one.
