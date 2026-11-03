@@ -3,3 +3,4 @@ __pycache__/
 .idea/
 gardenDB.db
 venv/
+sim_data/
