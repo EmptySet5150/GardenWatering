@@ -2,8 +2,9 @@
 Runs autoWatering.py on a PC with pretend hardware so you can try it without a Raspberry Pi.
 
 The real autoWatering.py runs unchanged. This file swaps in fake versions of RPi.GPIO, pigpio,
-DHT22 and RPLCD, and a simulated clock you can speed up. The simulator keeps its own config.ini
-and gardenDB.db in the sim_data folder so the real ones are never touched.
+DHT22 and RPLCD, and a simulated clock you can speed up. Each time the program starts it uses a
+fresh copy of the project's config.ini, and it keeps its own gardenDB.db in the sim_data folder so
+the real database is never touched.
 
 Run it with:  python simulator.py   (needs peewee:  pip install peewee)
 """
@@ -243,8 +244,7 @@ class Program:
         if self.running:
             return
         os.makedirs(SIM_DIR, exist_ok=True)
-        if not os.path.exists(os.path.join(SIM_DIR, 'config.ini')):
-            shutil.copy(os.path.join(HERE, 'config.ini'), SIM_DIR)
+        shutil.copy(os.path.join(HERE, 'config.ini'), SIM_DIR)  # always use the current settings
         StopProgram.requested = False
         self.globals = {'__name__': '__main__', '__file__': os.path.join(SIM_DIR, 'autoWatering.py'),
                         '__builtins__': make_builtins()}
@@ -480,7 +480,7 @@ def run_window():
 
     root.protocol('WM_DELETE_WINDOW', on_close)
     log_queue.put(f'Simulator files are in {SIM_DIR}')
-    log_queue.put('Edit sim_data/config.ini to change the simulated settings.')
+    log_queue.put('Settings come from config.ini. After editing it, press Stop, then Start program.')
     program.start()
     tick()
     root.mainloop()
