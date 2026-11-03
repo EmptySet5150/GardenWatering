@@ -7,13 +7,20 @@ of time to water the garden. If it starts to
 rain  or the  water level  gets low the pump
 will shut off and rest to  the next watering
 date.
+
+Settings are read from config.ini next to this file.
+It is meant to run as a systemd service (see garden-watering.service).
 """
 
 # Lets import a few things needed for the system
 from RPLCD import CharLCD  # Libaray for the LCD screen
-from time import sleep
-from datetime import datetime
-from dateutil.relativedelta import relativedelta  # Only used to add days to current date
+from time import sleep, time
+from datetime import datetime, timedelta
+import configparser
+import os
+import signal
+import socket
+import sys
 from model import SensorData  # Using peewee to interface with a SQLite database
 import RPi.GPIO as GPIO
 import DHT22  # Used for Temperature and Humidity sensor
@@ -32,36 +39,79 @@ waterLevel = 16
 sensorDatabase = SensorData()
 
 # Setup GPIO pin modes
-GPIO.setup(waterValveControl, GPIO.OUT)  # Set pin as output
-GPIO.setup(pumpControl, GPIO.OUT)  # Set pin as output
+GPIO.setup(waterValveControl, GPIO.OUT, initial=GPIO.HIGH)  # Set pin as output - relays are active low so start HIGH (off)
+GPIO.setup(pumpControl, GPIO.OUT, initial=GPIO.HIGH)  # Set pin as output - relays are active low so start HIGH (off)
 GPIO.setup(rainSensor, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Set pin as input and use internal pull up resistor
 GPIO.setup(waterLevel, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Set pin as imput and use internal pull up resistor
 
+# Read the settings from config.ini
+config = configparser.ConfigParser()
+if not config.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')):
+    sys.exit("config.ini is missing")
+waitDays = config.getint('watering', 'wait_days')
+pumpRunTime = config.getint('watering', 'pump_run_minutes')
+lowWaterReset = config.getint('watering', 'low_water_reset_days')
+wateringHour = config.getint('watering', 'watering_hour')
+
 # Setup some global variables
-waitDays = int(input("How many days to wait between waterings? "))
-pumpRunTime = int(input("How many minutes for the pump to run? "))
-valveNotOpen = int(input("How many minutes to wait to restart if the valve failes to open? "))
-lowWaterReset = int(input("How many days to wait if the water tank is low? "))
 firstRain = 1  # Setting this so we only get one reading while its raining
 firstLowWater = 1  # Setting this so we only get one reading while water level is low
+lastDhtRead = 0  # Time of the last DHT22 reading
+nextLogTime = datetime.now()  # Sensor readings are saved to the database every ten minutes
 
-# This data should get from the database
-lastWatered = (datetime.now())
-nextWatering = (datetime.now())
-pumpStopTime = (datetime.now())
+# Get the watering schedule from the last database row so a restart doesn't water right away
+lastWatered = datetime.now()
+nextWatering = datetime.now()
+pumpStopTime = datetime.now()
+lastRow = sensorDatabase.getLast()
+if lastRow is not None and isinstance(lastRow.LastWatering, datetime) and isinstance(lastRow.NextWatering, datetime):
+    lastWatered = lastRow.LastWatering
+    nextWatering = lastRow.NextWatering
+
+
+# Tells systemd we are ready or still alive - does nothing when not running as a service
+def sd_notify(state):
+    address = os.environ.get('NOTIFY_SOCKET')
+    if not address:
+        return
+    if address.startswith('@'):
+        address = '\0' + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.connect(address)
+        sock.sendall(state.encode())
+
+
+# Returns the next watering time, some days from now at the watering hour
+def watering_time(days):
+    return (datetime.now() + timedelta(days=days)).replace(hour=wateringHour, minute=0, second=0, microsecond=0)
+
+
+# systemd stops the service with SIGTERM - turn it into a normal exit so the finally block runs
+def stop_signal(signum, frame):
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, stop_signal)
+
+
+# Triggers a new DHT22 reading at most once every 3 seconds - reading it faster will hang the sensor
+def read_dht22():
+    global lastDhtRead
+    if time() - lastDhtRead >= 3:
+        dht22.trigger()  # Read the sensor then wait because the first reading is null
+        sleep(.2)
+        lastDhtRead = time()
 
 
 # Functions to return temperature and humidity readings from the DHT22 sensor
 def temperature_status():
-    dht22.trigger()  # Read the sensor then wait because the first reading is null
-    sleep(.2)
+    read_dht22()
     temp = '%.1f' % (dht22.temperature() * 1.8 + 32)  # Converting C to F and taking it out to one decimal place
     return temp
 
 
 def humidity_status():
-    dht22.trigger()
-    sleep(.2)
+    read_dht22()
     humid = '%.1f' % (dht22.humidity())  # Taking the humidity out to one decimal place
     return humid
 
@@ -80,10 +130,6 @@ def pump_control(cont):
         sleep(5)
         print("Closing Valve")
         GPIO.output(waterValveControl, 1)
-    elif cont == 'ERROR':
-        GPIO.output(pumpControl, 1)
-        GPIO.output(waterValveControl, 1)
-        print("Water valve failed to open")
 
 
 # Functions read the GPIO pins to determine if they are on or off and return a status
@@ -130,10 +176,10 @@ def get_data():
     return timenow, temp, humid, pump, rain, waterlevel, lastwater, nextwater, valve, pumpstop
 
 
-# Function gets data from get_data() and saves it to the database
+# Function reads the sensors and saves them to the database with the times as real datetimes
 def save_database():
-    timenow, temp, humid, pump, rain, waterlevel, lastwater, nextwater, valve, pumpstop = get_data()
-    sensorDatabase.saveData(timenow, lastwater, nextwater, pumpstop, temp, humid, waterlevel, rain, pump, valve)
+    sensorDatabase.saveData(datetime.now(), lastWatered, nextWatering, pumpStopTime, temperature_status(),
+                            humidity_status(), water_status(), rain_status(), pump_status(), valve_status())
 
 
 # Function gets data from get_data and displays it on the LCD screen
@@ -188,47 +234,48 @@ def print_data():
     print("    ------END------")
 
 
+sd_notify('READY=1')
+
 try:
     while True:
+        sd_notify('WATCHDOG=1')  # If the loop hangs systemd restarts the program, which turns the pump off
         lcd_display()
         print_data()
         print("Main loop display")
         print("FirstLowWater " + str(firstLowWater))
         print("FirstRain " + str(firstRain))
-        # If the pump is off we check to see if its time to turn it on
-        if pump_status() == 'OFF' and datetime.now() >= nextWatering:
-            pumpStopTime = datetime.now() + relativedelta(minutes=pumpRunTime)
+        # Save the sensor readings every ten minutes (this used to be the gardenDataSave.py cron job)
+        if datetime.now() >= nextLogTime:
+            nextLogTime = datetime.now() + timedelta(minutes=10)
+            save_database()
+            print("Saved to database - TEN MINUTE LOG")
+        # If the pump is off we check to see if its time to turn it on - never start it in the rain or with a low tank
+        if pump_status() == 'OFF' and datetime.now() >= nextWatering and rain_status() == 'DRY' and water_status() >= 10:
+            pumpStopTime = datetime.now() + timedelta(minutes=pumpRunTime)
             print("Time to Start pump")
             pump_control('Start')
             save_database()
             print("Saved to database - PUMP ON")
-            # We also check to see if the valve is closed and return a error if the valve is SHUT
-            if valve_status() == 'SHUT':
-                print("Valve is CLOSED - Unable to Start")
-                pump_control('ERROR')
-                nextWatering = lastWatered + relativedelta(minutes=valveNotOpen)
-                save_database()
-                print("Saved to database - VALVE ERROR")
+            # NOTE: valve_status() only reads back the relay pin we just set, so it can't tell
+            # if the valve really opened. A valve failure check needs a feedback sensor on the valve.
         # If the pump is on we check to see if it is time to turn it off and update nextWatering
         if pump_status() == 'ON' and datetime.now() >= pumpStopTime:
-            lastWatering = datetime.now()
-            addDays = datetime.now() + relativedelta(days=waitDays)
-            nextWatering = addDays.replace(hour=21, minute=0, second=0)
+            lastWatered = datetime.now()
+            nextWatering = watering_time(waitDays)
             print("Pump was turned off")
             pump_control('Stop')
             save_database()
             print("Saved to database - PUMP STOP TIME")
         # If the rain sensor is wet we reset the nextWatering and lastWatered time
-        if firstRain == 1 and rain_status() == 'Wet':
+        if firstRain == 1 and rain_status() == 'WET':
             firstRain = firstRain + 1
             print("Its Raining")
             pump_control('Stop')
             lastWatered = datetime.now()
-            addDays = datetime.now() + relativedelta(days=waitDays)
-            nextWatering = addDays.replace(hour=21, minute=00, second=00)
+            nextWatering = watering_time(waitDays)
             save_database()
             print("Saved data to database - RAIN SENSOR")
-        if firstRain > 1 and rain_status() == 'Dry':
+        if firstRain > 1 and rain_status() == 'DRY':
             firstRain = 1
             print("Its Not Raining")
         # If water level is to low we reset nextWatering to the next day
@@ -236,17 +283,20 @@ try:
             firstLowWater = firstLowWater + 1
             print("Water Level is LOW")
             pump_control('Stop')
-            lowWater = datetime.now() + relativedelta(days=lowWaterReset)
-            nextWatering = lowWater.replace(hour=21, minute=00, second=00)
+            nextWatering = watering_time(lowWaterReset)
             save_database()
             print("Saved to database - LOW WATER SENSOR")
         if firstLowWater > 1 and water_status() >= 10:
             firstLowWater = 1
             print("Water level is okay")
 
-# When program ends or is interupted we cleanup the GPIO pins
+# When program ends or is interupted we turn the pump off and cleanup the GPIO pins
 finally:
     print("Shutdown")
+    if pump_status() == 'ON':
+        pump_control('Stop')
+    GPIO.output(pumpControl, 1)
+    GPIO.output(waterValveControl, 1)
     sensorDatabase.close()
     print("Closed database")
     GPIO.cleanup()
