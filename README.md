@@ -22,7 +22,10 @@ Raspberry Pi OS Bookworm and newer block `pip install` outside a virtual environ
 packages go in `venv`. `--system-site-packages` lets it use the `pigpio` and `RPi.GPIO` installed by
 apt, so pip only adds `peewee` and `RPLCD`.
 
-Settings (days between waterings, pump run time, low water wait, watering hour) are in `config.ini`.
+Settings (days between waterings, pump run time, watering hour) are in `config.ini`.
+
+When the water tank is low the pump stops and nothing is watered. As soon as the tank is filled
+again, it waters if a watering is due.
 
 ## Run it as a service
 

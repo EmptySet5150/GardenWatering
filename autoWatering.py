@@ -4,9 +4,10 @@ to  determine  when the  garden needs  to be
 watered. When it needs watering it will turn
 on a pump and  open a valve for a set amount
 of time to water the garden. If it starts to
-rain  or the  water level  gets low the pump
-will shut off and rest to  the next watering
-date.
+rain the pump will  shut off  and rest to the
+next watering date.  If the water level  gets
+low the pump shuts off and waits for the tank
+to be filled, then waters if it is time to.
 
 Settings are read from config.ini next to this file.
 It is meant to run as a systemd service (see garden-watering.service).
@@ -50,7 +51,6 @@ if not config.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'con
     sys.exit("config.ini is missing")
 waitDays = config.getint('watering', 'wait_days')
 pumpRunTime = config.getint('watering', 'pump_run_minutes')
-lowWaterReset = config.getint('watering', 'low_water_reset_days')
 wateringHour = config.getint('watering', 'watering_hour')
 
 # Setup some global variables
@@ -278,12 +278,13 @@ try:
         if firstRain > 1 and rain_status() == 'DRY':
             firstRain = 1
             print("Its Not Raining")
-        # If water level is to low we reset nextWatering to the next day
+        # If water level is to low we stop the pump but keep nextWatering, so a watering that is
+        # due starts as soon as the tank is filled again
         if firstLowWater == 1 and water_status() < 10:
             firstLowWater = firstLowWater + 1
             print("Water Level is LOW")
-            pump_control('Stop')
-            nextWatering = watering_time(lowWaterReset)
+            if pump_status() == 'ON':
+                pump_control('Stop')
             save_database()
             print("Saved to database - LOW WATER SENSOR")
         if firstLowWater > 1 and water_status() >= 10:
