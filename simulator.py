@@ -529,11 +529,11 @@ def run_window():
         soak = program.value('soakUntil')
         soaking = isinstance(soak, real_datetime) and soak.timestamp() > clock.now()
         rows['Soaking until'].configure(text=fmt(soak) if soaking else '-')
-        pump_stop = program.value('pumpStopTime') if pump_on else None
-        rows['Pump stops at'].configure(text=fmt(pump_stop))
+        wet = program.value('wetLevel')
+        rows['Pump stops at'].configure(text=f'soil reaches {wet}%' if pump_on and wet is not None else '-')
         if program.value('dryLevel') is not None:
-            rows['Settings'].configure(text=f"water below {program.value('dryLevel')}%, pump "
-                                            f"{program.value('pumpRunTime')} min, soak "
+            rows['Settings'].configure(text=f"water below {program.value('dryLevel')}% until {wet}% "
+                                            f"(max {program.value('maxRunTime')} min), soak "
                                             f"{program.value('soakTime')} min")
         temp_lbl.configure(text=f'Temperature: {hw.temp_f:.0f} F')
         hum_lbl.configure(text=f'Humidity: {hw.humidity:.0f} %')

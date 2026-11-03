@@ -1,10 +1,10 @@
 """
 This program  reads a soil  moisture sensor
 to  determine  when the  garden needs  to be
-watered. When the soil is drier than the set
-level it opens a valve and runs a pump for a
-set amount of time, then waits for the water
-to soak  in before it checks the soil again.
+watered. When the soil is drier than the dry
+level it opens a valve  and runs a pump until
+the soil reaches the wet level, then waits for
+the water to soak in before checking again.
 If the water level gets low the pump shuts off
 and waits for the tank to be filled, then
 waters if the soil is still dry.
@@ -51,8 +51,9 @@ config = configparser.ConfigParser()
 if not config.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')):
     sys.exit("config.ini is missing")
 dryLevel = config.getint('watering', 'dry_level')
-pumpRunTime = config.getint('watering', 'pump_run_minutes')
+wetLevel = config.getint('watering', 'wet_level')
 soakTime = config.getint('watering', 'soak_minutes')
+maxRunTime = config.getint('watering', 'max_run_minutes', fallback=60)
 dryReading = config.getint('moisture_sensor', 'dry_reading')
 wetReading = config.getint('moisture_sensor', 'wet_reading')
 
@@ -65,7 +66,7 @@ nextLogTime = datetime.now()  # Sensor readings are saved to the database every 
 # Get the last watering and soak times from the database so a restart doesn't water during a soak
 lastWatered = None
 soakUntil = datetime.now()
-pumpStopTime = datetime.now()
+pumpStartTime = datetime.now()
 lastRow = sensorDatabase.getLast()
 if lastRow is not None and isinstance(lastRow.SoakUntil, datetime):
     lastWatered = lastRow.LastWatering
@@ -179,7 +180,7 @@ def valve_status():
 # Returns one line saying what the system is doing, for the LCD and the terminal
 def watering_state(moisture):
     if pump_status() == 'ON':
-        return "Watering til " + pumpStopTime.strftime('%H:%M')
+        return "Watering to %d%%" % wetLevel
     if water_status() < 10:
         return "Tank low - no water"
     if moisture is None:
@@ -207,7 +208,7 @@ def get_data():
 
 # Function reads the sensors and saves them to the database with the times as real datetimes
 def save_database():
-    sensorDatabase.saveData(datetime.now(), lastWatered, soakUntil, pumpStopTime, temperature_status(),
+    sensorDatabase.saveData(datetime.now(), lastWatered, soakUntil, temperature_status(),
                             humidity_status(), moisture_status(), water_status(), pump_status(), valve_status())
 
 
@@ -238,6 +239,8 @@ def lcd_display():
     lcd.write_string("Dry<%d%%" % dryLevel)
     lcd.cursor_pos = (2, 0)
     lcd.write_string("Tank:" + ('LOW' if waterlevel < 10 else 'OK'))
+    lcd.cursor_pos = (2, 11)
+    lcd.write_string("Wet>%d%%" % wetLevel)
     lcd.cursor_pos = (3, 0)
     lcd.write_string(state)
 
@@ -276,21 +279,38 @@ try:
         moisture = moisture_status()
         if pump_status() == 'OFF' and moisture is not None and moisture < dryLevel \
                 and datetime.now() >= soakUntil and water_status() >= 10:
-            pumpStopTime = datetime.now() + timedelta(minutes=pumpRunTime)
             print("Soil is dry (" + str(moisture) + "%) - starting pump")
+            pumpStartTime = datetime.now()
             pump_control('Start')
             save_database()
             print("Saved to database - PUMP ON")
             # NOTE: valve_status() only reads back the relay pin we just set, so it can't tell
             # if the valve really opened. A valve failure check needs a feedback sensor on the valve.
-        # When the run time is up, stop the pump and give the water time to soak in before checking again
-        if pump_status() == 'ON' and datetime.now() >= pumpStopTime:
+        # Keep watering until the soil reaches the wet level, then give the water time to soak in
+        moisture = moisture_status()
+        if pump_status() == 'ON' and moisture is not None and moisture >= wetLevel:
             lastWatered = datetime.now()
             soakUntil = datetime.now() + timedelta(minutes=soakTime)
-            print("Pump was turned off - soaking until " + soakUntil.strftime('%H:%M'))
+            print("Soil is wet (" + str(moisture) + "%) - pump turned off, soaking until " + soakUntil.strftime('%H:%M'))
             pump_control('Stop')
             save_database()
-            print("Saved to database - PUMP STOP TIME")
+            print("Saved to database - PUMP STOP")
+        # Backstop: if the soil never reaches the wet level (sensor pulled out of the soil, a broken hose)
+        # stop after max_run_minutes so the garden doesn't flood and the tank isn't emptied
+        if pump_status() == 'ON' and datetime.now() >= pumpStartTime + timedelta(minutes=maxRunTime):
+            lastWatered = datetime.now()
+            soakUntil = datetime.now() + timedelta(minutes=soakTime)
+            print("Soil didn't reach " + str(wetLevel) + "% in " + str(maxRunTime) +
+                  " minutes - pump turned off. Check the moisture sensor and hose")
+            pump_control('Stop')
+            save_database()
+            print("Saved to database - MAX RUN TIME")
+        # If the moisture sensor stops working while watering we can't tell when to stop, so stop now
+        if pump_status() == 'ON' and moisture is None:
+            print("Moisture sensor lost while watering - pump turned off")
+            pump_control('Stop')
+            save_database()
+            print("Saved to database - SENSOR LOST")
         # If water level is to low we stop the pump. When the tank is filled the soil is checked again
         # and watering starts if it is still dry
         if firstLowWater == 1 and water_status() < 10:

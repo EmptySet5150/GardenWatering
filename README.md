@@ -31,13 +31,14 @@ apt, so pip only adds `peewee`, `RPLCD` and `smbus2`.
 ## How it decides when to water
 
 A capacitive soil moisture sensor, read through an ADS1115, gives the soil moisture from 0% (dry air)
-to 100% (in water). When it drops below `dry_level`, the pump runs for `pump_run_minutes`. Then it
-waits `soak_minutes` for the water to soak in before checking the soil again, and waters again if the
-soil is still dry. These settings are in `config.ini`.
+to 100% (in water). When it drops below `dry_level`, the pump runs until the soil reaches `wet_level`.
+Then it waits `soak_minutes` before checking the soil again. As a backstop, the pump stops after
+`max_run_minutes` even if the soil never gets that wet, for example if the sensor was pulled out of the
+soil or a hose came off. These settings are in `config.ini`.
 
 It never waters while the water tank is low. As soon as the tank is filled again, it waters if the soil
-is still dry. If the moisture sensor can't be read, it doesn't water and the LCD shows
-`Soil sensor ERROR`.
+is still dry. If the moisture sensor can't be read, it doesn't water (and stops the pump if it was
+running) and the LCD shows `Soil sensor ERROR`.
 
 ## Calibrate the moisture sensor
 
