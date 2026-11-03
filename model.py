@@ -14,7 +14,6 @@ class Sensor(Model):
     TimeNow = DateTimeField()
     LastWatering = DateTimeField(null=True)
     SoakUntil = DateTimeField(null=True)
-    PumpStop = DateTimeField(null=True)
     Temperature = CharField()
     Humidity = CharField()
     Moisture = IntegerField(null=True)
@@ -33,8 +32,8 @@ class SensorData(object):
         db.create_tables([Sensor], safe=True)
 
     # Save one row of sensor readings to the database
-    def saveData(self, timenow, lastwater, soakuntil, pumpstop, temp, humid, moisture, waterlevel, pump, valve):
-        Sensor.create(TimeNow=timenow, LastWatering=lastwater, SoakUntil=soakuntil, PumpStop=pumpstop,
+    def saveData(self, timenow, lastwater, soakuntil, temp, humid, moisture, waterlevel, pump, valve):
+        Sensor.create(TimeNow=timenow, LastWatering=lastwater, SoakUntil=soakuntil,
                       Temperature=temp, Humidity=humid, Moisture=moisture, WaterLevel=waterlevel,
                       PumpStatus=pump, ValveStatus=valve)
 
