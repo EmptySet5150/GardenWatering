@@ -1,0 +1,24 @@
+# systemd service for the garden watering system
+# Install with:
+#   sudo cp garden-watering.service /etc/systemd/system/
+#   sudo systemctl enable --now pigpiod garden-watering
+# Change the paths and User below if the code is somewhere other than /home/garden/wateringSystem
+
+[Unit]
+Description=Garden watering system
+After=pigpiod.service
+Requires=pigpiod.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=garden
+WorkingDirectory=/home/garden/wateringSystem
+ExecStart=/usr/bin/python3 -u /home/garden/wateringSystem/autoWatering.py
+# Restart after a crash, and kill and restart it if the main loop stops checking in for 2 minutes
+Restart=always
+RestartSec=10
+WatchdogSec=120
+
+[Install]
+WantedBy=multi-user.target
